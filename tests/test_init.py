@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import os
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -48,7 +49,8 @@ async def status(hass_ws_client: WebSocketGenerator, **extra) -> dict:
 async def test_card_is_registered(
     hass: HomeAssistant, viewer: MockConfigEntry, extra_js: MagicMock, hass_client: ClientSessionGenerator
 ) -> None:
-    extra_js.assert_called_once_with(hass, "/prusa_gcode_viewer/prusa-gcode-viewer-card.js?v=1.0.0")
+    version = json.loads((Path(gcode.__file__).parent / "manifest.json").read_text())["version"]
+    extra_js.assert_called_once_with(hass, f"/prusa_gcode_viewer/prusa-gcode-viewer-card.js?v={version}")
     client = await hass_client()
     response = await client.get("/prusa_gcode_viewer/prusa-gcode-viewer-card.js")
     assert response.status == 200
@@ -135,6 +137,20 @@ async def test_unreadable_file_reports_an_error(
 
 
 @respx.mock
+async def test_file_still_in_its_transfer_directory(
+    hass: HomeAssistant, viewer: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Firmware 8 lists a Prusa Connect upload with size 0; its data is in the "p" file."""
+    respx.get(f"{HOST}/api/v1/job").respond(json=JOB | {"file": JOB["file"] | {"size": 0}})
+    respx.get(f"{HOST}/usb/STAR~1.GCO").respond(status_code=404)
+    respx.get(f"{HOST}/usb/STAR~1.GCO/p").respond(content=STAR)
+    first = await status(hass_ws_client)
+    assert first["size"] in (None, len(STAR))  # known once the download's Content-Length arrives
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert (await status(hass_ws_client))["state"] == "ready"
+
+
+@respx.mock
 async def test_printer_refuses_the_download(
     hass: HomeAssistant, viewer: MockConfigEntry, hass_ws_client: WebSocketGenerator
 ) -> None:
@@ -145,6 +161,32 @@ async def test_printer_refuses_the_download(
     failed = await status(hass_ws_client)
     assert failed["state"] == "error"
     assert "401" in failed["message"]
+
+
+@respx.mock
+async def test_file_missing(hass: HomeAssistant, viewer: MockConfigEntry, hass_ws_client: WebSocketGenerator) -> None:
+    respx.get(f"{HOST}/api/v1/job").respond(json=JOB)
+    respx.get(url__startswith=f"{HOST}/usb/").respond(status_code=404)
+    await status(hass_ws_client)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert (await status(hass_ws_client))["message"] == "Printer answered 404 for the file"
+
+
+@respx.mock
+async def test_a_new_job_of_the_same_file_is_a_new_print(
+    hass: HomeAssistant, viewer: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    job = respx.get(f"{HOST}/api/v1/job")
+    job.respond(json=JOB)
+    respx.get(f"{HOST}/usb/STAR~1.GCO").respond(content=STAR)
+    await status(hass_ws_client)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    first = await status(hass_ws_client)
+    # The printer finishing the transfer changes size and timestamp: same print.
+    job.respond(json=JOB | {"file": JOB["file"] | {"size": 1, "m_timestamp": 1}})
+    assert (await status(hass_ws_client))["key"] == first["key"]
+    job.respond(json=JOB | {"id": 8})
+    assert (await status(hass_ws_client))["state"] == "building"
 
 
 async def test_old_models_are_deleted(hass: HomeAssistant, viewer: MockConfigEntry) -> None:

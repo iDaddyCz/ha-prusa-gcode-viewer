@@ -57,6 +57,7 @@ class Build:
     job: Job
     task: asyncio.Task[None] | None = None
     received: int = 0
+    size: int | None = None
     stage: str = "downloading"
     error: str | None = None
     failed_at: float = 0.0
@@ -91,7 +92,7 @@ class ModelCache:
         if build and build.error and time.monotonic() - build.failed_at < RETRY_AFTER:
             return status | {"state": "error", "name": job.name, "message": build.error}
         if not build or build.error:
-            build = self._builds[job.key] = Build(job)
+            build = self._builds[job.key] = Build(job, size=job.size)
             build.task = self.entry.async_create_background_task(
                 self.hass, self._async_build(build), f"{DOMAIN} build {job.key}"
             )
@@ -100,7 +101,7 @@ class ModelCache:
             "name": job.name,
             "stage": build.stage,
             "received": build.received,
-            "size": job.size,
+            "size": build.size,
         }
 
     def path(self, key: str) -> Path:
@@ -169,25 +170,44 @@ class ModelCache:
             return None
         if response.status_code != 200:
             raise PrinterError(f"Printer answered {response.status_code} for the current job")
-        file = response.json().get("file") or {}
+        job = response.json()
+        file = job.get("file") or {}
         download = (file.get("refs") or {}).get("download")
         if not download:
             return None
         name = file.get("display_name") or file.get("name") or "print"
-        identity = f"{file.get('path')}/{file.get('name')}|{file.get('size')}|{file.get('m_timestamp')}"
+        # Size and timestamp change when the printer finishes a transfer, so a print is
+        # identified by its job id and file.
+        identity = f"{job.get('id')}|{file.get('path')}/{file.get('name')}|{name}"
         key = hashlib.sha1(identity.encode()).hexdigest()[:16]
-        return Job(key=key, name=name, download=download, size=file.get("size"))
+        return Job(key=key, name=name, download=download, size=file.get("size") or None)
 
     async def _async_download(self, build: Build) -> bytes:
         host, auth = self._printer()
         url = build.job.download if build.job.download.startswith("http") else f"{host}{build.job.download}"
+        try:
+            return await self._async_fetch(build, url, auth)
+        except FileNotFoundError:
+            pass
+        # A file sent from Prusa Connect stays a transfer directory, with the data in
+        # its "p" file, until the printer tidies it up (not while printing it).
+        try:
+            return await self._async_fetch(build, f"{url}/p", auth)
+        except FileNotFoundError:
+            raise PrinterError("Printer answered 404 for the file") from None
+
+    async def _async_fetch(self, build: Build, url: str, auth: httpx.DigestAuth) -> bytes:
         chunks = []
         client = get_async_client(self.hass)
         try:
             async with asyncio.timeout(DOWNLOAD_TIMEOUT):
                 async with client.stream("GET", url, auth=auth, timeout=JOB_TIMEOUT) as response:
+                    if response.status_code == 404:
+                        raise FileNotFoundError(url)
                     if response.status_code != 200:
                         raise PrinterError(f"Printer answered {response.status_code} for the file")
+                    if length := response.headers.get("Content-Length"):
+                        build.size = int(length)
                     async for chunk in response.aiter_bytes():
                         build.received += len(chunk)
                         if build.received > MAX_FILE_SIZE:
