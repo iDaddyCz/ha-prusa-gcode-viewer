@@ -14,7 +14,7 @@ import {
 } from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.2";
 const MAGIC = 0x31564750; // "PGV1"
 const POLL_MS = 2500;
 
@@ -292,9 +292,20 @@ class PrusaGcodeViewerCard extends HTMLElement {
     this._live = status.live;
     if (status.state === "building") {
       const mb = (n) => (n / 1e6).toFixed(1);
-      const progress = status.size ? `${mb(status.received)} / ${mb(status.size)} MB` : `${mb(status.received)} MB`;
+      let progress = status.size ? `${mb(status.received)} / ${mb(status.size)} MB` : `${mb(status.received)} MB`;
+      // The printer sends slowly while printing: estimate the time left from the last polls.
+      const now = Date.now();
+      const prev = this._download;
+      if (prev && prev.name === status.name && status.received > prev.received && status.size) {
+        const rate = (status.received - prev.received) / ((now - prev.at) / 1000);
+        const minutes = Math.ceil((status.size - status.received) / rate / 60);
+        progress += minutes > 1 ? `, about ${minutes} min left` : ", almost done";
+      }
+      if (!prev || prev.name !== status.name || now - prev.at > 20000) this._download = { name: status.name, received: status.received, at: now };
       this._showName(status.name, status.stage === "building" ? "Building the 3D view…" : `Downloading G-code… ${progress}`);
-      if (!this._model) this._setStatus("Preparing the 3D view of this print. The first view of a new print takes a moment.");
+      if (!this._model) {
+        this._setStatus("Preparing the 3D view of this print. The printer sends the file slowly while it prints, so the first view of a new print can take a while.");
+      }
       if (this._connected) this._poll = setTimeout(() => this._refresh(), POLL_MS);
       return;
     }

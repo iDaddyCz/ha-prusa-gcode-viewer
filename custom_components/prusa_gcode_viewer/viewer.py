@@ -26,6 +26,7 @@ from .const import (
     CACHE_KEEP,
     CONF_PRINTER,
     DOMAIN,
+    DOWNLOAD_STALL_TIMEOUT,
     DOWNLOAD_TIMEOUT,
     JOB_TIMEOUT,
     MAX_FILE_SIZE,
@@ -201,7 +202,8 @@ class ModelCache:
         client = get_async_client(self.hass)
         try:
             async with asyncio.timeout(DOWNLOAD_TIMEOUT):
-                async with client.stream("GET", url, auth=auth, timeout=JOB_TIMEOUT) as response:
+                timeout = httpx.Timeout(DOWNLOAD_STALL_TIMEOUT, connect=JOB_TIMEOUT)
+                async with client.stream("GET", url, auth=auth, timeout=timeout) as response:
                     if response.status_code == 404:
                         raise FileNotFoundError(url)
                     if response.status_code != 200:
