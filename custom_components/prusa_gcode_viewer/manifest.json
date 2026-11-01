@@ -1,0 +1,14 @@
+{
+  "domain": "prusa_gcode_viewer",
+  "name": "Prusa G-code Viewer",
+  "after_dependencies": ["prusalink"],
+  "codeowners": ["@iDaddyCz"],
+  "config_flow": true,
+  "dependencies": ["frontend", "http", "websocket_api"],
+  "documentation": "https://github.com/iDaddyCz/ha-prusa-gcode-viewer",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/iDaddyCz/ha-prusa-gcode-viewer/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}

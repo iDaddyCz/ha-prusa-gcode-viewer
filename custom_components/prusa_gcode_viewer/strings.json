@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Choose the printer",
+        "description": "The viewer downloads each new print's G-code from this PrusaLink printer once, the first time the card is opened.",
+        "data": {
+          "printer": "Printer"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Every PrusaLink printer already has a viewer.",
+      "no_printers": "Set up the PrusaLink integration for your printer first."
+    }
+  }
+}

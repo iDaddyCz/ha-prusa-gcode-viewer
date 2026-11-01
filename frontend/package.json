@@ -1,0 +1,15 @@
+{
+  "name": "prusa-gcode-viewer-card",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/card.js --bundle --minify --format=esm --target=es2020 --legal-comments=eof --outfile=../custom_components/prusa_gcode_viewer/www/prusa-gcode-viewer-card.js",
+    "check": "node --check src/card.js"
+  },
+  "dependencies": {
+    "three": "0.170.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.0"
+  }
+}
