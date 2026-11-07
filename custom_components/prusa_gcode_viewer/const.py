@@ -10,10 +10,11 @@ CONF_PRINTER = "printer"  # the PrusaLink config entry this viewer reads from
 URL_BASE = "/prusa_gcode_viewer"
 CARD_FILE = "prusa-gcode-viewer-card.js"
 MODEL_URL = "/api/prusa_gcode_viewer/model/{entry_id}/{key}"
+UPLOAD_URL = "/api/prusa_gcode_viewer/upload"
 
 # Built models kept on disk; older ones are deleted.
 CACHE_KEEP = 5
-# Largest G-code file downloaded from the printer.
+# Largest G-code file downloaded from the printer or dropped on the card.
 MAX_FILE_SIZE = 256 * 1024 * 1024
 JOB_TIMEOUT = 10
 # The printer serves files slowly while it prints (about 10 kB/s on a CORE One), so a

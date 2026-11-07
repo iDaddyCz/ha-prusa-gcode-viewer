@@ -17,11 +17,11 @@ import httpx
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.httpx_client import get_async_client
 
-from . import gcode
+from . import gcode, threemf
 from .const import (
     CACHE_KEEP,
     CONF_PRINTER,
@@ -64,6 +64,22 @@ class Build:
     failed_at: float = 0.0
 
 
+@dataclass
+class Upload:
+    name: str
+    task: asyncio.Task[None] | None = None
+    error: str | None = None
+    failed_at: float = 0.0
+
+
+def build_upload(data: bytes, name: str) -> tuple[bytes, str]:
+    """The model of a dropped file and a key for it (run in an executor)."""
+    paths = threemf.parse(data) if data[:4] == threemf.ZIP_MAGIC else gcode.parse_file(data)
+    if not paths.polyline_count:
+        raise gcode.GCodeError("The file has nothing to print")
+    return gcode.serialize(paths, name, uploaded=True), hashlib.sha1(data).hexdigest()[:16]
+
+
 class ModelCache:
     """One per viewer config entry: answers the card's status calls and builds models."""
 
@@ -73,12 +89,13 @@ class ModelCache:
         self.printer_entry_id: str = entry.data[CONF_PRINTER]
         self.directory = Path(hass.config.cache_path(DOMAIN, entry.entry_id))
         self._builds: dict[str, Build] = {}
+        self._upload: Upload | None = None
 
     # --- card API ----------------------------------------------------------------
 
     async def async_status(self) -> dict[str, Any]:
         """What the card should show now; starts a build for a new print."""
-        status: dict[str, Any] = {"entities": self.entities()}
+        status: dict[str, Any] = {"entities": self.entities(), **self._upload_status()}
         try:
             job = await self._async_current_job()
         except PrinterError as err:
@@ -86,8 +103,8 @@ class ModelCache:
             return status | await self._latest(live=False, message=str(err))
         if job is None:
             return status | await self._latest(live=False)
-        if await self.hass.async_add_executor_job(self.path(job.key).exists):
-            return status | self._ready(job.key, job.name, live=True)
+        if (revision := await self.hass.async_add_executor_job(self._revision, job.key)) is not None:
+            return status | self._ready(job.key, job.name, live=True, revision=revision)
 
         build = self._builds.get(job.key)
         if build and build.error and time.monotonic() - build.failed_at < RETRY_AFTER:
@@ -118,14 +135,31 @@ class ModelCache:
                     found[name] = entry.entity_id
         return found
 
-    def _ready(self, key: str, name: str, live: bool) -> dict[str, Any]:
+    def _revision(self, key: str) -> int | None:
+        """Changes when a dropped file replaces a model, as browsers cache model URLs for good."""
+        try:
+            return self.path(key).stat().st_mtime_ns
+        except FileNotFoundError:
+            return None
+
+    def _ready(self, key: str, name: str, live: bool, revision: int) -> dict[str, Any]:
         return {
             "state": "ready",
             "key": key,
+            "revision": revision,
             "name": name,
             "live": live,
-            "url": MODEL_URL.format(entry_id=self.entry.entry_id, key=key),
+            "url": f"{MODEL_URL.format(entry_id=self.entry.entry_id, key=key)}?v={revision}",
         }
+
+    def _upload_status(self) -> dict[str, Any]:
+        upload = self._upload
+        if upload is None:
+            return {}
+        if upload.error and time.monotonic() - upload.failed_at >= RETRY_AFTER:
+            self._upload = None
+            return {}
+        return {"upload": {"name": upload.name, "error": upload.error}}
 
     async def _latest(self, live: bool, message: str | None = None) -> dict[str, Any]:
         """The most recently built model, shown while nothing is printing."""
@@ -133,7 +167,8 @@ class ModelCache:
         if newest is None:
             return {"state": "idle", "message": message}
         key, name = newest
-        return self._ready(key, name, live) | ({"message": message} if message else {})
+        revision = await self.hass.async_add_executor_job(self._revision, key) or 0
+        return self._ready(key, name, live, revision) | ({"message": message} if message else {})
 
     def _newest_cached(self) -> tuple[str, str] | None:
         if not self.directory.is_dir():
@@ -239,6 +274,40 @@ class ModelCache:
         except Exception:
             build.error, build.failed_at = "Unexpected error, see the log", time.monotonic()
             _LOGGER.exception("Building a model of %s failed", job.name)
+
+    @callback
+    def async_upload(self, name: str, data: bytes) -> None:
+        """Build a model from a dropped file; it replaces the current print's, if there is one."""
+        if self._upload and self._upload.task:
+            self._upload.task.cancel()
+        upload = self._upload = Upload(name)
+        upload.task = self.entry.async_create_background_task(
+            self.hass, self._async_build_upload(upload, data), f"{DOMAIN} upload {name}"
+        )
+
+    async def _async_build_upload(self, upload: Upload, data: bytes) -> None:
+        try:
+            started = time.monotonic()
+            model, key = await self.hass.async_add_executor_job(build_upload, data, upload.name)
+            del data
+            try:
+                job = await self._async_current_job()
+            except PrinterError as err:
+                _LOGGER.debug("Printer unreachable, keeping %s as the last print: %s", upload.name, err)
+                job = None
+            target = Job(key=job.key if job else key, name=upload.name, download="", size=None)
+            await self.hass.async_add_executor_job(self._store, target, model)
+            # The file is here, so there's no need to wait for the printer to send it.
+            if job and (build := self._builds.pop(job.key, None)) and build.task:
+                build.task.cancel()
+            _LOGGER.debug("Built %s in %.1fs", upload.name, time.monotonic() - started)
+            self._upload = None
+        except gcode.GCodeError as err:
+            upload.error, upload.failed_at = str(err), time.monotonic()
+            _LOGGER.warning("Can't build a model of %s: %s", upload.name, err)
+        except Exception:
+            upload.error, upload.failed_at = "Unexpected error, see the log", time.monotonic()
+            _LOGGER.exception("Building a model of %s failed", upload.name)
 
     def _store(self, job: Job, model: bytes) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)

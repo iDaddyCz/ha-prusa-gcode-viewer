@@ -99,8 +99,8 @@ def test_star_model() -> None:
 
 
 SYNTHETIC = """\
-; filament_colour = #AA0000;;#00BB00
-; extruder_colour = #000001;#000002;#000003
+; filament_colour = #AA0000;#00BB00;#0000CC
+; extruder_colour = #000001;;#000003
 M83
 G28
 G1 Z0.2
@@ -147,5 +147,5 @@ def test_synthetic_paths() -> None:
     assert len(polylines) == 3
     assert list(paths.tools) == [0, 0, 2]
     header, *_ = read_model(gcode.serialize(paths))
-    # filament_colour wins, empty entries fall back to extruder_colour.
-    assert header["tools"] == ["#AA0000", "#000002", "#00BB00"]
+    # extruder_colour wins, empty entries fall back to filament_colour.
+    assert header["tools"] == ["#000001", "#00BB00", "#000003"]

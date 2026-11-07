@@ -247,6 +247,7 @@ class Toolpaths:
     tools: bytearray = field(default_factory=bytearray)
     type_names: list[str] = field(default_factory=list)
     meta: dict[str, str] = field(default_factory=dict)
+    outline: bool = False  # mesh outlines, not the toolpaths a slicer made
 
     @property
     def polyline_count(self) -> int:
@@ -429,11 +430,12 @@ def _text_chunks(data: bytes, size: int = 1 << 20) -> Iterator[str]:
 
 
 def _tool_colors(meta: dict[str, str], count: int) -> list[str]:
+    """As in PrusaSlicer's preview: the extruder's colour if it has one, else the filament's."""
     filament = meta.get("filament_colour", "").split(";")
     extruder = meta.get("extruder_colour", "").split(";")
     colors = []
     for i in range(count):
-        for source in (filament, extruder):
+        for source in (extruder, filament):
             if i < len(source) and _HEX_COLOR.match(source[i].strip()):
                 colors.append(source[i].strip().upper())
                 break
@@ -449,7 +451,7 @@ def _bed(meta: dict[str, str]) -> list[list[float]] | None:
         return None
 
 
-def serialize(paths: Toolpaths, name: str = "") -> bytes:
+def serialize(paths: Toolpaths, name: str = "", uploaded: bool = False) -> bytes:
     """The model as sent to the card: a JSON header followed by typed arrays.
 
     PGV1 | u32 header length | header JSON (space-padded to 4 bytes)
@@ -507,6 +509,8 @@ def serialize(paths: Toolpaths, name: str = "") -> bytes:
         "bed": _bed(meta),
         "estimated_time": meta.get("estimated printing time (normal mode)"),
         "layer_height": meta.get("layer_height"),
+        "uploaded": uploaded,
+        "outline": paths.outline,
     }
     blob = json.dumps(header, separators=(",", ":")).encode()
     blob += b" " * (-len(blob) % 4)

@@ -14,9 +14,12 @@ import {
 } from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-const VERSION = "1.0.2";
+const VERSION = "1.1.0";
 const MAGIC = 0x31564750; // "PGV1"
 const POLL_MS = 2500;
+const UPLOAD_URL = "/api/prusa_gcode_viewer/upload";
+const MAX_UPLOAD = 256 * 1024 * 1024; // the integration's MAX_FILE_SIZE
+const FILE_TYPES = /\.(gcode|gco|bgcode|3mf)$/i;
 
 // PrusaSlicer's feature colours, for color_by: type.
 const TYPE_COLORS = {
@@ -220,7 +223,7 @@ class PrusaGcodeViewerCard extends HTMLElement {
           font-size: 13px; line-height: 1.35; color: var(--primary-text-color);
           text-shadow: 0 0 4px var(--card-background-color, #000); }
         .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .sub { color: var(--secondary-text-color); }
+        .sub, .activity { color: var(--secondary-text-color); }
         .status { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
           padding: 24px; text-align: center; color: var(--secondary-text-color); font-size: 14px; }
         .status[hidden] { display: none; }
@@ -232,21 +235,29 @@ class PrusaGcodeViewerCard extends HTMLElement {
         .hint { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); font-size: 12px;
           color: var(--secondary-text-color); pointer-events: none; }
         .hint[hidden] { display: none; }
+        .drop { position: absolute; inset: 6px; display: flex; align-items: center; justify-content: center;
+          border: 2px dashed var(--primary-color); border-radius: 10px; pointer-events: none; font-size: 14px;
+          color: var(--primary-text-color); background: color-mix(in srgb, var(--card-background-color, #000) 80%, transparent); }
+        .drop[hidden] { display: none; }
       </style>
       <ha-card>
         <div class="stage"></div>
-        <div class="info"><div class="name"></div><div class="sub"></div></div>
+        <div class="info"><div class="name"></div><div class="sub"></div><div class="activity"></div></div>
         <div class="status">Loading…</div>
         <div class="hint" hidden>Tap to rotate and zoom</div>
+        <div class="drop" hidden>Drop to show this file</div>
+        <input class="picker" type="file" accept=".gcode,.gco,.bgcode,.3mf" hidden>
         <div class="buttons">
+          <button class="open" title="Show a G-code or 3MF file instead of downloading from the printer">Open</button>
           <button class="walls" title="Show only the outer walls">Walls</button>
           <button class="reset" title="Reset the view">Reset</button>
           <button class="done" hidden>Done</button>
         </div>
       </ha-card>`;
     const $ = (s) => this._root.querySelector(s);
-    this._el = { stage: $(".stage"), name: $(".name"), sub: $(".sub"), status: $(".status"), hint: $(".hint"),
-      walls: $(".walls"), reset: $(".reset"), done: $(".done") };
+    this._el = { stage: $(".stage"), name: $(".name"), sub: $(".sub"), activity: $(".activity"), status: $(".status"),
+      hint: $(".hint"), drop: $(".drop"), picker: $(".picker"), open: $(".open"), walls: $(".walls"), reset: $(".reset"),
+      done: $(".done") };
     this._el.walls.addEventListener("click", () => {
       this._walls = !this._walls;
       this._rebuild();
@@ -256,8 +267,45 @@ class PrusaGcodeViewerCard extends HTMLElement {
       ev.stopPropagation();
       this._setInteractive(false);
     });
+    this._el.open.addEventListener("click", () => this._el.picker.click());
+    this._el.picker.addEventListener("change", () => {
+      const file = this._el.picker.files[0];
+      this._el.picker.value = "";
+      if (file) this._upload(file);
+    });
+    this._setupDrop($("ha-card"));
     this._render();
     this._initGl();
+  }
+
+  _setupDrop(card) {
+    let depth = 0; // entering a child element fires dragenter before the parent's dragleave
+    const hasFile = (ev) => ev.dataTransfer?.types?.includes("Files");
+    const show = () => (this._el.drop.hidden = depth === 0);
+    card.addEventListener("dragenter", (ev) => {
+      if (!hasFile(ev)) return;
+      ev.preventDefault();
+      depth++;
+      show();
+    });
+    card.addEventListener("dragover", (ev) => {
+      if (!hasFile(ev)) return;
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = "copy";
+    });
+    card.addEventListener("dragleave", (ev) => {
+      if (!hasFile(ev)) return;
+      depth = Math.max(0, depth - 1);
+      show();
+    });
+    card.addEventListener("drop", (ev) => {
+      if (!hasFile(ev)) return;
+      ev.preventDefault();
+      depth = 0;
+      show();
+      const file = ev.dataTransfer.files[0];
+      if (file) this._upload(file);
+    });
   }
 
   _render() {
@@ -270,7 +318,74 @@ class PrusaGcodeViewerCard extends HTMLElement {
     this._el.status.hidden = !text;
   }
 
+  _setActivity(text) {
+    this._el.activity.textContent = text || "";
+  }
+
   // --- data ----------------------------------------------------------------------
+
+  _schedule(ms) {
+    clearTimeout(this._poll);
+    if (this._connected) this._poll = setTimeout(() => this._refresh(), ms);
+  }
+
+  // Sends a dropped file to the integration, which builds its model like a downloaded one.
+  async _upload(file) {
+    if (this._uploading) return;
+    if (!FILE_TYPES.test(file.name)) {
+      this._setActivity(`Can't show ${file.name}: use a G-code or 3MF file.`);
+      return;
+    }
+    if (file.size > MAX_UPLOAD) {
+      this._setActivity(`Can't show ${file.name}: it's larger than ${MAX_UPLOAD / 1024 / 1024} MB.`);
+      return;
+    }
+    this._uploading = true;
+    try {
+      await this._send(file);
+      this._setActivity(`Building the 3D view of ${file.name}…`);
+    } catch (err) {
+      this._setActivity(`Couldn't send ${file.name}: ${err.message}`);
+    } finally {
+      this._uploading = false;
+    }
+    this._schedule(500);
+  }
+
+  // XMLHttpRequest rather than fetch, which can't report upload progress.
+  async _send(file) {
+    const { auth } = this._hass;
+    if (auth.expired) await auth.refreshAccessToken();
+    const query = new URLSearchParams({ name: file.name });
+    if (this._config.entry_id) query.set("entry_id", this._config.entry_id);
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${UPLOAD_URL}?${query}`);
+      xhr.setRequestHeader("Authorization", `Bearer ${auth.accessToken}`);
+      xhr.upload.onprogress = (ev) => {
+        const percent = ev.lengthComputable ? ` ${Math.round((ev.loaded / ev.total) * 100)}%` : "";
+        this._setActivity(`Sending ${file.name}…${percent}`);
+      };
+      xhr.onload = () => {
+        if (xhr.status < 300) resolve();
+        else reject(new Error(xhr.status === 413 ? "it's too large" : `HTTP ${xhr.status}`));
+      };
+      xhr.onerror = () => reject(new Error("the connection failed"));
+      this._setActivity(`Sending ${file.name}…`);
+      xhr.send(file);
+    });
+  }
+
+  _followUpload(upload) {
+    if (this._uploading) return;
+    if (!upload) {
+      if (this._building) this._setActivity("");
+      this._building = false;
+      return;
+    }
+    this._building = true;
+    this._setActivity(upload.error ? `Can't show ${upload.name}: ${upload.error}` : `Building the 3D view of ${upload.name}…`);
+  }
 
   async _refresh() {
     clearTimeout(this._poll);
@@ -288,6 +403,9 @@ class PrusaGcodeViewerCard extends HTMLElement {
       this._busy = false;
     }
     this._entities = status.entities || {};
+    this._followUpload(status.upload);
+    // An error stays on the card until the server forgets it.
+    if (status.upload) this._schedule(status.upload.error ? 30000 : POLL_MS);
     if (this._live !== status.live) this._splitOf = undefined;
     this._live = status.live;
     if (status.state === "building") {
@@ -306,39 +424,48 @@ class PrusaGcodeViewerCard extends HTMLElement {
       if (!this._model) {
         this._setStatus("Preparing the 3D view of this print. The printer sends the file slowly while it prints, so the first view of a new print can take a while.");
       }
-      if (this._connected) this._poll = setTimeout(() => this._refresh(), POLL_MS);
+      this._schedule(POLL_MS);
       return;
     }
     if (status.state === "error") {
       this._showName(status.name, "");
       this._setStatus(`Can't show this print: ${status.message}`);
-      if (this._connected) this._poll = setTimeout(() => this._refresh(), 30000);
+      this._schedule(30000);
       return;
     }
     if (status.state === "idle") {
-      this._setStatus(status.message ? `No model yet: ${status.message}` : "No print to show yet.");
+      const hint = "Drop a G-code or 3MF file here to show it.";
+      this._setStatus(status.message ? `No model yet: ${status.message}. ${hint}` : `No print to show yet. ${hint}`);
       return;
     }
-    if (status.key !== this._key) await this._load(status);
+    const key = `${status.key}:${status.revision}`;
+    if (key !== this._key && key !== this._loading) await this._load(status, key);
     this._applyProgress();
   }
 
-  async _load(status) {
-    let model = models.get(status.key);
+  async _load(status, key) {
+    let model = models.get(key);
     if (!model) {
-      this._setStatus("Loading the 3D view…");
+      this._loading = key;
+      if (!this._model) this._setStatus("Loading the 3D view…");
       try {
         const response = await this._hass.fetchWithAuth(status.url);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         model = parseModel(await response.arrayBuffer());
       } catch (err) {
-        this._setStatus(`Couldn't load the model: ${err.message}`);
+        if (this._loading === key) {
+          this._loading = undefined;
+          this._setStatus(`Couldn't load the model: ${err.message}`);
+        }
         return;
       }
+      // A newer model was asked for while this one was on its way.
+      if (this._loading !== key) return;
+      this._loading = undefined;
       models.clear(); // keep one model in memory
-      models.set(status.key, model);
+      models.set(key, model);
     }
-    this._key = status.key;
+    this._key = key;
     this._model = model;
     this._setStatus("");
     this._rebuild();
@@ -455,8 +582,9 @@ class PrusaGcodeViewerCard extends HTMLElement {
     this._pending.geometry.setDrawRange(split * 2, (total - split) * 2);
     const header = model.header;
     const parts = [`Layer ${done} / ${layers.length}`];
-    if (!this._live) parts.push("last print");
-    else if (header.estimated_time) parts.push(`${header.estimated_time} total`);
+    if (header.uploaded) parts.push(header.outline ? "dropped 3MF, outlines only" : "dropped file");
+    else if (!this._live) parts.push("last print");
+    if (this._live && header.estimated_time) parts.push(`${header.estimated_time} total`);
     this._showName(header.name, parts.join(" · "));
     this._draw();
   }

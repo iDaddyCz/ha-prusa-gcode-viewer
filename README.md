@@ -10,6 +10,7 @@ The card draws the toolpaths from the print's G-code, as PrusaSlicer's preview d
 - **New print:** it downloads the G-code once (plain `.gcode` or binary `.bgcode`) and builds a compact model of the extrusion paths. The model is saved in `/config/.cache/prusa_gcode_viewer`, which isn't included in backups. The last 5 models are kept.
 - **Same print again:** the saved model is served straight away. The printer isn't asked for the file again.
 - **Nothing printing:** the card shows the last print.
+- **Dropped file:** a G-code or 3MF file dropped on the card is used without asking the printer for it. See [Showing a file](#showing-a-file).
 
 The first view of a new print downloads the file from the printer. That takes from a few seconds to a few minutes, depending on the file size and the printer's network. The card shows the download progress.
 
@@ -40,7 +41,18 @@ type: custom:prusa-gcode-viewer-card
 | `walls`    | `false` | Start with only the outer walls shown. The **Walls** button toggles this. |
 | `entry_id` | –       | Which viewer to use when several printers are set up. |
 
+To skip the slow download from the printer, drag the print's file onto the card, or use the **Open** button on a phone. See [Showing a file](#showing-a-file).
+
 Drag to rotate, scroll or pinch to zoom, and right-drag or two-finger drag to pan. **Reset** goes back to the starting view. On a phone, tap the card first to rotate it, so the page still scrolls normally; **Done** releases it.
+
+## Showing a file
+
+The card accepts `.gcode`, `.bgcode` and `.3mf` files of up to 256 MB. Home Assistant builds the model, as it does for a file from the printer, so it needs no extra software and every device sees the result.
+
+- **While printing:** the file replaces the model of the current print and any download from the printer stops. The card still follows the printer's Z height. Drop another file to replace it.
+- **While not printing:** the file is shown until the next print starts. It's kept with the other saved models, but isn't linked to that print, so the next print downloads its own file as usual.
+
+A 3MF slicer project usually holds meshes, not toolpaths, so the card cuts each mesh into an outline per layer, labelled "outlines only". This shows the shape, filament colours, painted areas and layers, but no infill, supports, brim or wipe tower. Layers use the project's layer height, without variable layer heights, so the layer count can differ from the sliced print. A 3MF with sliced G-code in it (Bambu Studio, OrcaSlicer) shows that G-code instead. For exact toolpaths, drop the exported G-code.
 
 ## Development
 
