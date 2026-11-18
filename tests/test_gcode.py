@@ -38,6 +38,22 @@ def test_heatshrink_round_trip(bits: tuple[int, int]) -> None:
     assert gcode.heatshrink_decode(heatshrink_encode(data, *bits), *bits) == data
 
 
+@pytest.mark.parametrize("bits", [(11, 4), (12, 4)])
+def test_heatshrink_back_reference_into_the_zeroed_window(bits: tuple[int, int]) -> None:
+    # heatshrink's window starts as zero bytes, so a stream may reference bytes
+    # before the first output byte: 3 bytes from 3 back (zeros), the literal
+    # "A", then 2 bytes from 4 back (the first two zeros).
+    window, lookahead = bits
+    stream = (
+        "0" + format(3 - 1, f"0{window}b") + format(3 - 1, f"0{lookahead}b")
+        + "1" + format(ord("A"), "08b")
+        + "0" + format(4 - 1, f"0{window}b") + format(2 - 1, f"0{lookahead}b")
+    )
+    stream += "0" * (-len(stream) % 8)
+    encoded = int(stream, 2).to_bytes(len(stream) // 8, "big")
+    assert gcode.heatshrink_decode(encoded, window, lookahead) == b"\x00\x00\x00A\x00\x00"
+
+
 @pytest.mark.parametrize("nospace", [True, False])
 def test_meatpack_round_trip(nospace: bool) -> None:
     text = "G1 X117.584 Y102.025 E.00926\n;TYPE:External perimeter\nM73 P4 R11\n\nT1\nG28 W ; home\n"

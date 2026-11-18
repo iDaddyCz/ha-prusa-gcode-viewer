@@ -75,13 +75,13 @@ def heatshrink_decode(src: bytes, window_bits: int, lookahead_bits: int) -> byte
             nbits -= lookahead_bits
             count = ((acc >> nbits) & count_mask) + 1
             start = len(out) - offset
-            if start < 0:
-                raise GCodeError("Corrupt heatshrink stream")
-            if offset >= count:
+            if start >= 0 and offset >= count:
                 out += out[start : start + count]
             else:
-                for i in range(count):
-                    out.append(out[start + i])
+                # heatshrink's window starts as zero bytes, so a back-reference
+                # may reach before the first output byte; those bytes are 0.
+                for _ in range(count):
+                    out.append(out[-offset] if offset <= len(out) else 0)
         acc &= (1 << nbits) - 1
     return bytes(out)
 
