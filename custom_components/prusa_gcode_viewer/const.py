@@ -28,6 +28,9 @@ RETRY_AFTER = 120
 PRUSALINK_SENSORS = {
     "state": "printer.state",
     "z": "printer.telemetry.z-height",
+    # Optional (disabled by default in PrusaLink): the nozzle marker follows them while printing.
+    "x": "printer.telemetry.x-position",
+    "y": "printer.telemetry.y-position",
     "progress": "job.progress",
     "file": "job.filename",
 }

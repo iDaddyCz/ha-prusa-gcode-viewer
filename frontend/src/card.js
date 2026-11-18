@@ -1,12 +1,19 @@
 // Prusa G-code Viewer card: draws the toolpaths of the print the printer is running.
 // Printed layers are solid, the rest faint; the split follows the printer's Z height.
+// A layer slider and a move slider scrub through the print (OctoPrint's G-code viewer
+// controls), a cone marks the nozzle, and a 2D mode shows one layer from above with the
+// layer below it faint. "Live" returns to following the printer.
 
 import {
   BufferAttribute,
   BufferGeometry,
   Color,
+  ConeGeometry,
   LineBasicMaterial,
   LineSegments,
+  Mesh,
+  MeshBasicMaterial,
+  OrthographicCamera,
   PerspectiveCamera,
   Scene,
   Vector3,
@@ -239,6 +246,16 @@ class PrusaGcodeViewerCard extends HTMLElement {
           border: 2px dashed var(--primary-color); border-radius: 10px; pointer-events: none; font-size: 14px;
           color: var(--primary-text-color); background: color-mix(in srgb, var(--card-background-color, #000) 80%, transparent); }
         .drop[hidden] { display: none; }
+        .layers { position: absolute; right: 6px; top: 58px; bottom: 76px; width: 26px; display: flex;
+          flex-direction: column; align-items: center; gap: 4px; }
+        .layers input { flex: 1; width: 22px; margin: 0; writing-mode: vertical-lr; direction: rtl;
+          accent-color: var(--primary-color); opacity: .75; }
+        .layers input:hover, .layers input:focus, .moves input:hover, .moves input:focus { opacity: 1; }
+        .layer-label { font-size: 11px; color: var(--secondary-text-color); white-space: nowrap; }
+        .moves { position: absolute; left: 12px; right: 40px; bottom: 44px; display: flex; align-items: center; gap: 6px; }
+        .moves input { flex: 1; margin: 0; accent-color: var(--primary-color); opacity: .75; }
+        .layers[hidden], .moves[hidden] { display: none; }
+        .live:not(.on) { border-color: var(--primary-color); }
       </style>
       <ha-card>
         <div class="stage"></div>
@@ -247,7 +264,17 @@ class PrusaGcodeViewerCard extends HTMLElement {
         <div class="hint" hidden>Tap to rotate and zoom</div>
         <div class="drop" hidden>Drop to show this file</div>
         <input class="picker" type="file" accept=".gcode,.gco,.bgcode,.3mf" hidden>
+        <div class="layers" hidden>
+          <span class="layer-label top"></span>
+          <input class="layer" type="range" min="1" max="1" step="1" title="Layer" aria-label="Layer">
+          <span class="layer-label bottom">1</span>
+        </div>
+        <div class="moves" hidden>
+          <input class="move" type="range" min="0" max="1000" step="1" value="1000" title="Moves in this layer" aria-label="Moves in this layer">
+        </div>
         <div class="buttons">
+          <button class="live on" title="Follow the printer">Live</button>
+          <button class="flat" title="Show one layer from above, with the layer below it faint">2D</button>
           <button class="open" title="Show a G-code or 3MF file instead of downloading from the printer">Open</button>
           <button class="walls" title="Show only the outer walls">Walls</button>
           <button class="reset" title="Reset the view">Reset</button>
@@ -257,7 +284,30 @@ class PrusaGcodeViewerCard extends HTMLElement {
     const $ = (s) => this._root.querySelector(s);
     this._el = { stage: $(".stage"), name: $(".name"), sub: $(".sub"), activity: $(".activity"), status: $(".status"),
       hint: $(".hint"), drop: $(".drop"), picker: $(".picker"), open: $(".open"), walls: $(".walls"), reset: $(".reset"),
-      done: $(".done") };
+      done: $(".done"), layers: $(".layers"), layer: $(".layer"), layerTop: $(".layer-label.top"), moves: $(".moves"),
+      move: $(".move"), live: $(".live"), flat: $(".flat") };
+    // Scrubbing leaves Live: the view stays on the chosen layer until Live is pressed.
+    this._el.layer.addEventListener("input", () => {
+      this._manual = { layer: Number(this._el.layer.value), move: 1 };
+      this._el.move.value = this._el.move.max;
+      this._applyProgress();
+    });
+    this._el.move.addEventListener("input", () => {
+      const layer = this._manual?.layer ?? this._liveLayer ?? 1;
+      this._manual = { layer, move: Number(this._el.move.value) / Number(this._el.move.max) };
+      this._applyProgress();
+    });
+    this._el.live.addEventListener("click", () => {
+      this._manual = undefined;
+      this._el.move.value = this._el.move.max;
+      this._applyProgress();
+    });
+    this._el.flat.addEventListener("click", () => {
+      this._flat = !this._flat;
+      this._useCamera();
+      this._fitCamera();
+      this._applyProgress(true);
+    });
     this._el.walls.addEventListener("click", () => {
       this._walls = !this._walls;
       this._rebuild();
@@ -311,6 +361,8 @@ class PrusaGcodeViewerCard extends HTMLElement {
   _render() {
     this.style.setProperty("--pgv-height", `${this._config.height}px`);
     this._el.walls.classList.toggle("on", this._walls);
+    this._el.flat.classList.toggle("on", !!this._flat);
+    this._el.live.classList.toggle("on", !this._manual);
   }
 
   _setStatus(text) {
@@ -486,11 +538,14 @@ class PrusaGcodeViewerCard extends HTMLElement {
     this._el.stage.appendChild(renderer.domElement);
     const camera = new PerspectiveCamera(35, 1, 0.5, 5000);
     camera.up.set(0, 0, 1);
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.addEventListener("change", () => this._draw());
+    // The 2D layer view looks straight down with no perspective.
+    const top = new OrthographicCamera(-1, 1, 1, -1, 0.1, 5000);
+    top.up.set(0, 1, 0);
+    this._perspective = camera;
+    this._top = top;
     this._renderer = renderer;
-    this._camera = camera;
-    this._controls = controls;
+    this._camera = this._flat ? top : camera;
+    this._makeControls();
     this._scene = new Scene();
     this._resize = new ResizeObserver(() => this._onResize());
     this._resize.observe(this._el.stage);
@@ -510,6 +565,7 @@ class PrusaGcodeViewerCard extends HTMLElement {
     if (!this._renderer) return;
     this._resize.disconnect();
     this._controls.dispose();
+    this._perspective = this._top = undefined;
     this._disposeScene();
     this._renderer.dispose();
     this._renderer.forceContextLoss();
@@ -523,6 +579,25 @@ class PrusaGcodeViewerCard extends HTMLElement {
       obj.material.dispose();
       this._scene.remove(obj);
     }
+  }
+
+  _makeControls() {
+    this._controls?.dispose();
+    const controls = new OrbitControls(this._camera, this._renderer.domElement);
+    controls.enableRotate = !this._flat;
+    controls.addEventListener("change", () => this._draw());
+    this._controls = controls;
+  }
+
+  // Switches between the 3D view and the 2D layer view's top-down camera.
+  _useCamera() {
+    if (!this._renderer) return;
+    this._camera = this._flat ? this._top : this._perspective;
+    const enabled = this._controls?.enabled ?? true;
+    this._makeControls();
+    this._controls.enabled = enabled;
+    this._onResize();
+    this._render();
   }
 
   _setInteractive(on) {
@@ -550,21 +625,36 @@ class PrusaGcodeViewerCard extends HTMLElement {
     };
     this._printed = make(1);
     this._pending = make(0.13);
+    this._previous = make(0.3); // the layer below, in the 2D view
+    const nozzleColor = new Color(getComputedStyle(this).getPropertyValue("--primary-color").trim() || "#fa6831");
+    const cone = new ConeGeometry(1.4, 4, 16);
+    cone.rotateX(-Math.PI / 2); // tip down along -Z
+    cone.translate(0, 0, 2); // tip at the origin
+    this._nozzle = new Mesh(cone, new MeshBasicMaterial({ color: nozzleColor, transparent: true, opacity: 0.9 }));
+    this._nozzle.visible = false;
     const bedColor = new Color(getComputedStyle(this).getPropertyValue("--secondary-text-color").trim() || "#888");
     const bed = new LineSegments(
       bedGeometry(this._model.header),
       new LineBasicMaterial({ color: bedColor, transparent: true, opacity: 0.25, depthWrite: false }),
     );
-    this._scene.add(bed, this._printed, this._pending);
+    this._scene.add(bed, this._previous, this._printed, this._pending, this._nozzle);
+    const layers = this._model.header.layers.length;
+    this._el.layer.max = String(Math.max(1, layers));
+    this._el.layerTop.textContent = String(layers);
+    this._el.layers.hidden = this._el.moves.hidden = layers < 2;
     this._setInteractive(false);
-    this._applyProgress();
+    this._applyProgress(true);
   }
 
-  // Splits printed from unprinted at the printer's current Z height.
-  _applyProgress() {
+  // Splits printed from unprinted: at the printer's current Z height while live, or at the
+  // layer and move the sliders chose. The 2D view shows only the chosen layer, with the
+  // layer below it faint.
+  _applyProgress(force) {
     const model = this._model;
     if (!model || !this._segments) return;
     const layers = model.header.layers;
+    const starts = this._segments.layerStarts;
+    const total = this._segments.count;
     let done = layers.length;
     const zState = this._hass?.states[this._entities?.z]?.state;
     const z = parseFloat(zState);
@@ -572,26 +662,85 @@ class PrusaGcodeViewerCard extends HTMLElement {
       done = layers.findIndex((l) => l.z > z + 0.01);
       if (done < 0) done = layers.length;
     }
-    const split = this._segments.layerStarts[done];
-    // Called on every Home Assistant state change: only redraw when the split moves.
-    if (split === this._split && this._segments === this._splitOf) return;
+    this._liveLayer = Math.max(1, done);
+    // The layer on show (1-based) and how much of it is drawn solid.
+    const layer = this._manual ? Math.min(Math.max(1, this._manual.layer), layers.length) : Math.max(1, done);
+    const move = this._manual ? this._manual.move : 1;
+    const layerStart = starts[layer - 1];
+    const layerEnd = starts[layer];
+    const split = this._manual ? layerStart + Math.round((layerEnd - layerStart) * move) : starts[done];
+    const key = `${split}|${layer}|${this._flat ? 1 : 0}|${this._nozzleKey()}`;
+    // Called on every Home Assistant state change: only redraw when something moved.
+    if (!force && key === this._viewKey && this._segments === this._splitOf) return;
+    this._viewKey = key;
     this._split = split;
     this._splitOf = this._segments;
-    const total = this._segments.count;
-    this._printed.geometry.setDrawRange(0, split * 2);
-    this._pending.geometry.setDrawRange(split * 2, (total - split) * 2);
+    if (this._flat) {
+      this._printed.geometry.setDrawRange(layerStart * 2, (split - layerStart) * 2);
+      this._pending.geometry.setDrawRange(split * 2, (layerEnd - split) * 2);
+      const below = layer >= 2 ? starts[layer - 2] : layerStart;
+      this._previous.geometry.setDrawRange(below * 2, (layerStart - below) * 2);
+    } else {
+      this._printed.geometry.setDrawRange(0, split * 2);
+      this._pending.geometry.setDrawRange(split * 2, (total - split) * 2);
+      this._previous.geometry.setDrawRange(0, 0);
+    }
+    this._placeNozzle(split, layer);
+    if (document.activeElement !== this && this._root.activeElement !== this._el.layer) this._el.layer.value = String(layer);
+    this._render();
     const header = model.header;
-    const parts = [`Layer ${done} / ${layers.length}`];
-    if (header.uploaded) parts.push(header.outline ? "dropped 3MF, outlines only" : "dropped file");
+    const parts = [`Layer ${layer} / ${layers.length}`];
+    const layerZ = layers[layer - 1]?.z;
+    if (layerZ !== undefined) parts.push(`Z ${layerZ.toFixed(2)} mm`);
+    if (this._manual) parts.push(this._live ? "browsing · Live returns" : "browsing");
+    else if (header.uploaded) parts.push(header.outline ? "dropped 3MF, outlines only" : "dropped file");
     else if (!this._live) parts.push("last print");
-    if (this._live && header.estimated_time) parts.push(`${header.estimated_time} total`);
+    if (!this._manual && this._live && header.estimated_time) parts.push(`${header.estimated_time} total`);
     this._showName(header.name, parts.join(" · "));
     this._draw();
+  }
+
+  // Where the nozzle is: the end of the path on show while browsing, the printer's reported
+  // position while live (when PrusaLink's X/Y position sensors are enabled), else hidden.
+  _nozzleKey() {
+    if (this._manual || !this._live) return "path";
+    const e = this._entities || {};
+    return ["x", "y", "z"].map((k) => this._hass?.states[e[k]]?.state).join(",");
+  }
+
+  _placeNozzle(split, layer) {
+    const nozzle = this._nozzle;
+    if (!nozzle) return;
+    const positions = this._segments.positions;
+    if (this._manual || !this._live) {
+      const segment = Math.max(0, Math.min(split, this._segments.count) - 1);
+      const inLayer = split > this._segments.layerStarts[layer - 1] || layer === 1;
+      nozzle.visible = this._segments.count > 0 && inLayer && (this._manual !== undefined);
+      if (nozzle.visible) nozzle.position.set(positions[segment * 6 + 3], positions[segment * 6 + 4], positions[segment * 6 + 5]);
+      return;
+    }
+    const e = this._entities || {};
+    const read = (k) => parseFloat(this._hass?.states[e[k]]?.state);
+    const [x, y, z] = [read("x"), read("y"), read("z")];
+    nozzle.visible = ![x, y, z].some(Number.isNaN);
+    if (nozzle.visible) nozzle.position.set(x, y, z);
   }
 
   _fitCamera() {
     if (!this._camera || !this._segments) return;
     const [lo, hi] = this._segments.bounds;
+    if (this._flat) {
+      // Top-down: frame the object's footprint.
+      const span = Math.max(10, hi[0] - lo[0], hi[1] - lo[1]) * 0.6;
+      this._top.position.set((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, hi[2] + 100);
+      this._top.zoom = 1;
+      this._topSpan = span;
+      this._onResize();
+      this._controls.target.set((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, 0);
+      this._controls.update();
+      this._draw();
+      return;
+    }
     const center = new Vector3((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2);
     const radius = Math.max(5, new Vector3(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]).length() / 2);
     const distance = (radius / Math.sin(((this._camera.fov / 2) * Math.PI) / 180)) * 1.05;
@@ -609,8 +758,11 @@ class PrusaGcodeViewerCard extends HTMLElement {
     const { clientWidth: w, clientHeight: h } = this._el.stage;
     if (!w || !h) return;
     this._renderer.setSize(w, h, false);
-    this._camera.aspect = w / h;
-    this._camera.updateProjectionMatrix();
+    this._perspective.aspect = w / h;
+    this._perspective.updateProjectionMatrix();
+    const span = this._topSpan || 100;
+    Object.assign(this._top, { left: (-span * w) / h, right: (span * w) / h, top: span, bottom: -span });
+    this._top.updateProjectionMatrix();
     this._draw();
   }
 
